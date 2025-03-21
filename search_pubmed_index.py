@@ -8,6 +8,7 @@ import nltk
 from nltk.tokenize import sent_tokenize
 
 nltk.data.path.append("/home/samsung/haoquan/nltk_data")
+import datetime
 import json
 import pickle
 import heapq
@@ -754,7 +755,7 @@ def process_query(
         documents=es_results,
         embedding_method=embedding_method,
         model_instance=bgem_model,
-        max_snippets=20,
+        max_snippets=10,
     )
     console_logger.info(
         f"Query {query_idx}/{total_queries} - Relevant snippets extraction completed."
@@ -780,8 +781,9 @@ def main():
     2. Query Elasticsearch for document details of the top 10 PMIDs.
     3. Extract relevant snippets from the documents based on the query.
     """
-    input_json_filepath = "/home/samsung/haoquan/bioasq2024-main/02_12B/Batch1/PhaseA/BioASQ-task11bPhaseA-testset1.json"
-    output_json_filepath = "BioASQ-task11bPhaseA-testset1_run_file_snippets_20.json"
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    input_json_filepath = "/mnt/data/dataset/BioASQ/Task12BGoldenEnriched/12B1_golden.json"
+    output_json_filepath = f"{timestamp}_BioASQ-task12bBatch1PhaseA-testset1_run_file_snippets_10.json"
     # output_json_filepath = 'test.json'
 
     # Determine log file path based on output_json_filepath
@@ -802,7 +804,8 @@ def main():
 
     # Module initialization
     embedding_method = "bgem"  # Choose "ollama" or "bgem"
-    index_dir = "/mnt/data/haoquan/pubmed/faiss_index_data"
+    # index_dir = "/mnt/data/haoquan/pubmed/faiss_index_data"
+    index_dir = "/mnt/data/haoquan/pubmed/faiss_index_data_training13bft"
     # index_dir = "/mnt/data/haoquan/pubmed/test"
     bgem_model = (
         BGEM3FlagModel("/mnt/data/haoquan/model/bge-m3")
@@ -814,7 +817,7 @@ def main():
     es_client = Elasticsearch("http://109.105.34.64:9200")
 
     results = []
-    with ThreadPoolExecutor(max_workers=85) as executor:
+    with ThreadPoolExecutor(max_workers=100) as executor:
         future_to_question = {
             executor.submit(
                 process_query,
