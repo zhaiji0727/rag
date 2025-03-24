@@ -1,12 +1,15 @@
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk
-from BGEM3FlagModel import BGEM3FlagModel
+from FlagEmbedding import BGEM3FlagModel
 import gzip
 import os
 from shutil import move
 import concurrent.futures
 import time
 from datetime import timedelta
+import traceback
+import io
+from lxml import etree
 
 # Initialize the embedding model
 embed_model = BGEM3FlagModel('/mnt/data/haoquan/model/bge-m3')
@@ -16,9 +19,9 @@ es = Elasticsearch("http://109.105.34.64:9200")
 
 # Ensure that the index does not exist already
 try:
-    if not es.indices.exists(index="pubmed25"):
+    if not es.indices.exists(index="pubmed25_with_vector"):
         resp = es.indices.create(
-            index="pubmed25",
+            index="pubmed25_with_vector",
             body={
                 "settings": {"number_of_shards": 1, "number_of_replicas": 1},
                 "mappings": {
@@ -26,8 +29,8 @@ try:
                         "title": {"type": "text", "analyzer": "english"},
                         "abstract": {"type": "text", "analyzer": "english"},
                         "url": {"type": "keyword"},
-                        "title_vector": {"type": "dense_vector", "dims": 768},
-                        "abstract_vector": {"type": "dense_vector", "dims": 768},
+                        "title_vector": {"type": "dense_vector", "dims": 1024},
+                        "abstract_vector": {"type": "dense_vector", "dims": 1024},
                     }
                 },
             },
@@ -37,8 +40,8 @@ except Exception as e:
     print(f"Error creating index: {e}")
     print(traceback.format_exc())  # Print the full stack trace
 
-def encode_text(text):
-    return embed_model.encode([text])['dense_vecs'][0]
+def encode_texts(texts):
+    return embed_model.encode(texts, return_dense=True, return_colbert_vecs=False, return_sparse=False)['dense_vecs']
 
 def parse_xml_content(xml_content):
     """
@@ -68,7 +71,7 @@ def parse_xml_content(xml_content):
         result = []
 
         for child in root:
-            entry = {"title": None, "abstract": None, "pmid": None, "url": None, "title_vector": None, "abstract_vector": None}
+            entry = {"title": None, "abstract": None, "pmid": None, "url": None}
 
             if child.tag == 'PubmedArticle' or child.tag == 'PubmedBookArticle':
                 # Extract PMID
@@ -97,10 +100,6 @@ def parse_xml_content(xml_content):
                 continue  # Skip DeleteCitation elements
 
             if entry["pmid"]:  # Add only if PMID is present
-                if entry["title"]:
-                    entry["title_vector"] = encode_text(entry["title"])
-                if entry["abstract"]:
-                    entry["abstract_vector"] = encode_text(entry["abstract"])
                 result.append(entry)
             else:
                 raise ValueError("Element has no pmid!")
@@ -119,8 +118,27 @@ def process_file(file_path, processed_directory):
             file_content = f.read()
             articles = parse_xml_content(file_content)
 
+            # Prepare titles and abstracts for bulk encoding
+            titles = [article["title"] for article in articles if article["title"]]
+            abstracts = [article["abstract"] for article in articles if article["abstract"]]
+
+            # Encode titles and abstracts in bulk
+            title_vectors = encode_texts(titles) if titles else []
+            abstract_vectors = encode_texts(abstracts) if abstracts else []
+
+            # Assign vectors back to articles
+            title_idx = 0
+            abstract_idx = 0
+            for article in articles:
+                if article["title"]:
+                    article["title_vector"] = title_vectors[title_idx]
+                    title_idx += 1
+                if article["abstract"]:
+                    article["abstract_vector"] = abstract_vectors[abstract_idx]
+                    abstract_idx += 1
+
             # Prepare articles for bulk indexing and perform bulk indexing
-            actions = [{"_index": "pubmed25", "_id": article["pmid"], "_source": article} for article in articles]
+            actions = [{"_index": "pubmed25_with_vector", "_id": article["pmid"], "_source": article} for article in articles]
             for chunk in chunker(actions, 50):
                 bulk(es, list(chunk))
 
@@ -149,7 +167,7 @@ def index_directory(directory_path, processed_directory):
     total_files = len(file_paths)
     processed_files = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_file = {executor.submit(process_file, file_path, processed_directory): file_path for file_path in file_paths}
 
         for future in concurrent.futures.as_completed(future_to_file):
