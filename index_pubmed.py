@@ -1,50 +1,27 @@
-#!/usr/bin/env python3
-import os
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import bulk
+from FlagEmbedding import BGEM3FlagModel
 import gzip
-import io
-from lxml import etree
-# from opensearchpy import OpenSearch, RequestsHttpConnection
-# from opensearchpy.helpers import bulk  # Importing bulk from opensearchpy.helpers
-from shutil import move  # Importing move from shutil
-# from dotenv import load_dotenv
-import traceback  # Import the traceback module
+import os
+from shutil import move
 import concurrent.futures
 import time
 from datetime import timedelta
+import traceback
+import io
+from lxml import etree
 
-
-# Load environment variables from .env file
-# load_dotenv()
-
-# # Use credentials from .env file
-# auth = (
-#     os.getenv('OPENSEARCH_USERNAME', ''),
-#     os.getenv('OPENSEARCH_PASSWORD', '')
-# )
-
-# # Initialize OpenSearch client with self-signed certificate
-# es = OpenSearch(
-#     hosts=[{
-#         'host': os.getenv('OPENSEARCH_HOST', 'localhost'),
-#         'port': int(os.getenv('OPENSEARCH_PORT', 9200))
-#     }],
-#     http_auth=auth,
-#     use_ssl=True,
-#     verify_certs=False,  # Set to True in production with a valid certificate
-#     ssl_show_warn=False,  # Suppress warning for self-signed certificate
-#     connection_class=RequestsHttpConnection
-# )
-from elasticsearch import Elasticsearch
-from elasticsearch.helpers import bulk
+# Initialize the embedding model
+embed_model = BGEM3FlagModel('/mnt/data/haoquan/model/bge-m3')
 
 # Connect to Elasticsearch
 es = Elasticsearch("http://109.105.34.64:9200")
 
 # Ensure that the index does not exist already
 try:
-    if not es.indices.exists(index="pubmed25"):
+    if not es.indices.exists(index="pubmed25_with_vector"):
         resp = es.indices.create(
-            index="pubmed25",
+            index="pubmed25_with_vector",
             body={
                 "settings": {"number_of_shards": 1, "number_of_replicas": 1},
                 "mappings": {
@@ -52,6 +29,8 @@ try:
                         "title": {"type": "text", "analyzer": "english"},
                         "abstract": {"type": "text", "analyzer": "english"},
                         "url": {"type": "keyword"},
+                        "title_vector": {"type": "dense_vector", "dims": 1024},
+                        "abstract_vector": {"type": "dense_vector", "dims": 1024},
                     }
                 },
             },
@@ -61,6 +40,8 @@ except Exception as e:
     print(f"Error creating index: {e}")
     print(traceback.format_exc())  # Print the full stack trace
 
+def encode_text(text):
+    return embed_model.encode([text], return_dense=True, return_colbert_vecs=False, return_sparse=False)['dense_vecs'][0]
 
 def parse_xml_content(xml_content):
     """
@@ -90,7 +71,7 @@ def parse_xml_content(xml_content):
         result = []
 
         for child in root:
-            entry = {"title": None, "abstract": None, "pmid": None, "url": None}
+            entry = {"title": None, "abstract": None, "pmid": None, "url": None, "title_vector": None, "abstract_vector": None}
 
             if child.tag == 'PubmedArticle' or child.tag == 'PubmedBookArticle':
                 # Extract PMID
@@ -119,14 +100,16 @@ def parse_xml_content(xml_content):
                 continue  # Skip DeleteCitation elements
 
             if entry["pmid"]:  # Add only if PMID is present
+                if entry["title"]:
+                    entry["title_vector"] = encode_text(entry["title"])
+                if entry["abstract"]:
+                    entry["abstract_vector"] = encode_text(entry["abstract"])
                 result.append(entry)
             else:
                 raise ValueError("Element has no pmid!")
 
         root.clear()
         return result
-
-
 
 def chunker(seq, size):
     """Yield successive chunks of size from seq."""
@@ -140,7 +123,7 @@ def process_file(file_path, processed_directory):
             articles = parse_xml_content(file_content)
 
             # Prepare articles for bulk indexing and perform bulk indexing
-            actions = [{"_index": "pubmed25", "_id": article["pmid"], "_source": article} for article in articles]
+            actions = [{"_index": "pubmed25_with_vector", "_id": article["pmid"], "_source": article} for article in articles]
             for chunk in chunker(actions, 50):
                 bulk(es, list(chunk))
 
@@ -169,7 +152,7 @@ def index_directory(directory_path, processed_directory):
     total_files = len(file_paths)
     processed_files = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_file = {executor.submit(process_file, file_path, processed_directory): file_path for file_path in file_paths}
 
         for future in concurrent.futures.as_completed(future_to_file):
@@ -188,7 +171,6 @@ def index_directory(directory_path, processed_directory):
     total_time = timedelta(seconds=time.time() - start_time)
     print(f"Indexing complete. Total time: {total_time}")
 
-
 def main():
     # Example usage
     pubmed_dir = "/mnt/data/haoquan/pubmed"
@@ -201,10 +183,5 @@ def main():
         print(f"Error during indexing: {e}")
         print(traceback.format_exc())  # Print the full stack trace
 
-
 if __name__ == "__main__":
     main()
-
-
-    # embed_model = BGEM3FlagModel('/mnt/data/haoquan/model/bge-m3')
-    # embed_model.encode(sentences_2)['dense_vecs']
