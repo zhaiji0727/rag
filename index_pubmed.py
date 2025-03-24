@@ -10,6 +10,9 @@ from datetime import timedelta
 import traceback
 import io
 from lxml import etree
+import threading
+
+_bgem_semaphore = threading.BoundedSemaphore(1)
 
 # Initialize the embedding model
 embed_model = BGEM3FlagModel('/mnt/data/haoquan/model/bge-m3')
@@ -40,8 +43,9 @@ except Exception as e:
     print(f"Error creating index: {e}")
     print(traceback.format_exc())  # Print the full stack trace
 
-def encode_text(text):
-    return embed_model.encode([text], return_dense=True, return_colbert_vecs=False, return_sparse=False)['dense_vecs'][0]
+def encode_texts(texts):
+    with _bgem_semaphore:
+        return embed_model.encode(texts, return_dense=True, return_colbert_vecs=False, return_sparse=False)['dense_vecs']
 
 def parse_xml_content(xml_content):
     """
@@ -71,7 +75,7 @@ def parse_xml_content(xml_content):
         result = []
 
         for child in root:
-            entry = {"title": None, "abstract": None, "pmid": None, "url": None, "title_vector": None, "abstract_vector": None}
+            entry = {"title": None, "abstract": None, "pmid": None, "url": None}
 
             if child.tag == 'PubmedArticle' or child.tag == 'PubmedBookArticle':
                 # Extract PMID
@@ -100,10 +104,6 @@ def parse_xml_content(xml_content):
                 continue  # Skip DeleteCitation elements
 
             if entry["pmid"]:  # Add only if PMID is present
-                if entry["title"]:
-                    entry["title_vector"] = encode_text(entry["title"])
-                if entry["abstract"]:
-                    entry["abstract_vector"] = encode_text(entry["abstract"])
                 result.append(entry)
             else:
                 raise ValueError("Element has no pmid!")
@@ -122,6 +122,37 @@ def process_file(file_path, processed_directory):
             file_content = f.read()
             articles = parse_xml_content(file_content)
 
+            # Prepare titles and abstracts for bulk encoding
+            titles = [article["title"] for article in articles if article["title"]]
+            abstracts = [article["abstract"] for article in articles if article["abstract"]]
+
+            # Encode titles and abstracts in bulk
+            title_vectors = encode_texts(titles) if titles else []
+            abstract_vectors = encode_texts(abstracts) if abstracts else []
+
+            # Ensure the lengths match
+            if len(title_vectors) != len(titles):
+                raise ValueError(f"Mismatch between number of titles({len(titles)}) and title vectors({len(title_vectors)}).")
+            if len(abstract_vectors) != len(abstracts):
+                raise ValueError(f"Mismatch between number of abstracts({len(abstracts)}) and abstract vectors({len(abstract_vectors)}).")
+
+            # Assign vectors back to articles
+            title_idx = 0
+            abstract_idx = 0
+            for article in articles:
+                if article["title"]:
+                    if title_idx < len(title_vectors):
+                        article["title_vector"] = title_vectors[title_idx]
+                        title_idx += 1
+                    else:
+                        raise IndexError("Title vector index out of range.")
+                if article["abstract"]:
+                    if abstract_idx < len(abstract_vectors):
+                        article["abstract_vector"] = abstract_vectors[abstract_idx]
+                        abstract_idx += 1
+                    else:
+                        raise IndexError("Abstract vector index out of range.")
+
             # Prepare articles for bulk indexing and perform bulk indexing
             actions = [{"_index": "pubmed25_with_vector", "_id": article["pmid"], "_source": article} for article in articles]
             for chunk in chunker(actions, 50):
@@ -139,6 +170,7 @@ def process_file(file_path, processed_directory):
         print(f"Error indexing file {file_path}: {e}")
         print(traceback.format_exc())  # Print the full stack trace
 
+
 def index_directory(directory_path, processed_directory):
     """
     Indexes all gzipped XML files in a given directory, moves processed files, and shows progress.
@@ -152,7 +184,7 @@ def index_directory(directory_path, processed_directory):
     total_files = len(file_paths)
     processed_files = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_to_file = {executor.submit(process_file, file_path, processed_directory): file_path for file_path in file_paths}
 
         for future in concurrent.futures.as_completed(future_to_file):
@@ -164,7 +196,7 @@ def index_directory(directory_path, processed_directory):
                 progress = (processed_files / total_files) * 100
                 avg_time_per_file = elapsed_time / processed_files
                 remaining_time = avg_time_per_file * (total_files - processed_files)
-                print(f"Completed indexing {os.path.basename(file_path)}. Progress: {progress:.2f}%. Estimated time left: {timedelta(seconds=remaining_time)}")
+                print(f"Completed indexing {os.path.basename(file_path)}. Progress: {processed_files}/{total_files} ({progress:.2f}%). Estimated time left: {timedelta(seconds=remaining_time)}")
             except Exception as e:
                 print(f"Error processing file {os.path.basename(file_path)}: {e}")
 
