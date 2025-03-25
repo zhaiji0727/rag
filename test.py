@@ -377,67 +377,6 @@ def get_relevant_snippets(examples, n, articles, question, model_name):
             article['snippets'] = snippets
             processed_articles.append(article)
     return processed_articles
-
-def process_question(question, query_examples, snip_extract_examples, snip_rerank_examples, n_shot, model_name):
-    try:
-        query_string = ""
-        improved_query_string = ""
-        relevant_articles_ids = []
-        filtered_articles_ids = []
-        reordered_articles_ids = []
-        relevant_snippets = []
-
-        question_id = question['id']
-        print(f"Processing question {question_id}")
-        wiki_context = ""
-
-        completion = expand_query_few_shot(query_examples, n_shot, question['body'], model_name)
-        query_string = extract_text_wrapped_in_tags(completion)
-        query = create_query(query_string)
-
-        relevant_articles = run_elasticsearch_query(query)
-        if len(relevant_articles) == 0:
-            improved_query_completion = refine_query_with_no_results(question['body'], query_string, model_name)
-            improved_query_string = extract_text_wrapped_in_tags(improved_query_completion)
-            query = create_query(improved_query_string)
-            relevant_articles = run_elasticsearch_query(query)
-            if len(relevant_articles) > 0:
-                print("Query refinement worked")
-            
-        relevant_articles_ids = [article['id'] for article in relevant_articles]
-        
-        filtered_articles = get_relevant_snippets(snip_extract_examples, n_shot, relevant_articles, question['body'], model_name)
-        filtered_articles_ids = [article['id'] for article in filtered_articles]
-        relevant_snippets = [snippet for article in filtered_articles for snippet in article['snippets']]
-
-        reranked_snippets = rerank_snippets(snip_rerank_examples, n_shot, relevant_snippets, question['body'], model_name)
-        
-        reordered_articles_ids = reorder_articles_by_snippet_sequence(filtered_articles_ids, reranked_snippets)
-
-        return {
-            "question_id": question["id"],
-            "question_body": question["body"],
-            "question_type": question["type"],
-            "wiki_context": wiki_context,
-            "completion": completion,
-            "query": query_string,
-            "improved_query": improved_query_string,
-            "relevant_articles": relevant_articles_ids,
-            "filtered_articles": filtered_articles_ids,
-            "documents": reordered_articles_ids,
-            "snippets": reranked_snippets
-        }
-    except Exception as e:
-        print(f"Error processing question {question['id']}: {e}")
-        traceback.print_exc()
-        return {
-            "question_id": question.get("id", "error"),
-            "question_body": question.get("body", "error"),
-            "question_type": question.get("type", "error"),
-            "query": query_string or "error",
-            "improved_query": improved_query_string or "error",
-            "relevant_articles": relevant_articles_ids or [],
-            "filtered_articles
             
 def process_question(question, query_examples, snip_extract_examples, snip_rerank_examples, n_shot, model_name):
     try:
