@@ -438,3 +438,165 @@ def process_question(question, query_examples, snip_extract_examples, snip_reran
             "improved_query": improved_query_string or "error",
             "relevant_articles": relevant_articles_ids or [],
             "filtered_articles
+            
+def process_question(question, query_examples, snip_extract_examples, snip_rerank_examples, n_shot, model_name):
+    try:
+        query_string = ""
+        improved_query_string = ""
+        relevant_articles_ids = []
+        filtered_articles_ids = []
+        reordered_articles_ids = []
+        relevant_snippets = []
+
+        question_id = question['id']
+        print(f"Processing question {question_id}")
+        wiki_context = ""
+
+        completion = expand_query_few_shot(query_examples, n_shot, question['body'], model_name)
+        query_string = extract_text_wrapped_in_tags(completion)
+        query = create_query(query_string)
+
+        relevant_articles = run_elasticsearch_query(query)
+        if len(relevant_articles) == 0:
+            improved_query_completion = refine_query_with_no_results(question['body'], query_string, model_name)
+            improved_query_string = extract_text_wrapped_in_tags(improved_query_completion)
+            query = create_query(improved_query_string)
+            relevant_articles = run_elasticsearch_query(query)
+            if len(relevant_articles) > 0:
+                print("Query refinement worked")
+            
+        relevant_articles_ids = [article['id'] for article in relevant_articles]
+        
+        filtered_articles = get_relevant_snippets(snip_extract_examples, n_shot, relevant_articles, question['body'], model_name)
+        filtered_articles_ids = [article['id'] for article in filtered_articles]
+        relevant_snippets = [snippet for article in filtered_articles for snippet in article['snippets']]
+
+        reranked_snippets = rerank_snippets(snip_rerank_examples, n_shot, relevant_snippets, question['body'], model_name)
+        
+        reordered_articles_ids = reorder_articles_by_snippet_sequence(filtered_articles_ids, reranked_snippets)
+
+        return {
+            "question_id": question["id"],
+            "question_body": question["body"],
+            "question_type": question["type"],
+            "wiki_context": wiki_context,
+            "completion": completion,
+            "query": query_string,
+            "improved_query": improved_query_string,
+            "relevant_articles": relevant_articles_ids,
+            "filtered_articles": filtered_articles_ids,
+            "documents": reordered_articles_ids,
+            "snippets": reranked_snippets
+        }
+    except Exception as e:
+        print(f"Error processing question {question['id']}: {e}")
+        traceback.print_exc()
+        return {
+            "question_id": question.get("id", "error"),
+            "question_body": question.get("body", "error"),
+            "question_type": question.get("type", "error"),
+            "query": query_string or "error",
+            "improved_query": improved_query_string or "error",
+            "relevant_articles": relevant_articles_ids or [],
+            "filtered_articles": filtered_articles_ids or [],
+            "documents": reordered_articles_ids[:10] if reordered_articles_ids else [],
+            "snippets": relevant_snippets or []
+        }
+
+def main():
+    model_name = 'llama3.2:3B'
+    n_shot = 10
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    pickl_name = model_name.replace('/', '-').replace(':', '-') if '/' in model_name or ':' in model_name else model_name
+    pickl_file = f'{pickl_name}-{n_shot}-shot.pkl'
+
+    input_file_name = '/mnt/data/dataset/BioASQ/Task12BGoldenEnriched/12B1_golden.json'
+    query_examples = pd.read_csv('2024-03-26_19-24-27_claude-3-opus-20240229_11B1-10-Shot_Retrieval.csv')
+    snip_extract_examples = read_jsonl_file("Snippet_Extraction_Examples.jsonl")
+    snip_rerank_examples = read_jsonl_file("Snippet_Reranking_Examples.jsonl")
+
+    with open(input_file_name) as input_file:
+        data = json.loads(input_file.read())
+
+    saved_df = load_state(pickl_file)
+    questions_df = saved_df if saved_df is not None and not saved_df.empty else pd.DataFrame(columns=[
+        'question_id', 'question_body', 'question_type', 'wiki_context', 'completion', 'query', 'improved_query', 'relevant_articles', 'filtered_articles', 'documents', 'snippets'])
+
+    processed_ids = set(questions_df['question_id']) if not questions_df.empty else set()
+    questions_to_process = [q for q in data["questions"] if q["id"] not in processed_ids]
+
+    total_questions = len(questions_to_process)
+    processed_count = 0
+
+    start_time = time.time()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_question = {executor.submit(process_question, q, query_examples, snip_extract_examples, snip_rerank_examples, n_shot, model_name): q for q in questions_to_process}
+
+        for future in as_completed(future_to_question):
+            question = future_to_question[future]
+            processed_count += 1
+            try:
+                result = future.result()
+                if result:
+                    result_df = pd.DataFrame([result])
+                    questions_df = pd.concat([questions_df, result_df], ignore_index=True)
+                    save_state(questions_df, pickl_file)
+                print(f"Progress: {processed_count}/{total_questions} questions processed ({(processed_count / total_questions) * 100:.2f}%)")
+            except Exception as e:
+                print(f"Error processing question {question['id']}: {e}")
+                traceback.print_exc()
+    
+    print(f'Model name: {model_name}, n-shot: {n_shot}, Time: {timedelta(seconds=time.time() - start_time)}')
+
+    model_name_pretty = model_name.split("/")[-1] if '/' in model_name else model_name
+    output_file_name = f"./Results/{timestamp}_{model_name_pretty}_2024AB1-Fine-Tuned-{n_shot}-Shot.csv"
+
+    os.makedirs(os.path.dirname(output_file_name), exist_ok=True)
+    questions_df.to_csv(output_file_name, index=False)
+
+    try:
+        if os.path.exists(pickl_file):
+            os.remove(pickl_file)
+            print("Intermediate state pickle file deleted successfully.")
+    except Exception as e:
+        print(f"Error deleting pickle file: {e}")
+        traceback.print_exc()
+
+def csv_to_json(csv_filepath, json_filepath):
+    empty = 0
+    df = pd.read_csv(csv_filepath)
+    questions_list = df.to_dict(orient='records')
+    json_structure = {"questions": []}
+
+    for item in questions_list:
+        if item["question_type"] in ["list", "factoid"]:
+            exact_answer_format = [[]]
+        else:
+            exact_answer_format = ""
+            
+        if len(eval(item["relevant_articles"])) == 0:
+            empty += 1
+
+        question_dict = {
+            "documents": eval(item["documents"])[:10],
+            "snippets": eval(item["snippets"])[:10],
+            "body": item["question_body"],
+            "type": item["question_type"],
+            "id": item["question_id"],
+            "ideal_answer": ""
+        }
+        if item["question_type"] != "summary":
+            question_dict["exact_answer"] = exact_answer_format
+        
+        json_structure["questions"].append(question_dict)
+    
+    with open(json_filepath, 'w', encoding='utf-8') as json_file:
+        json.dump(json_structure, json_file, ensure_ascii=False, indent=4)
+    print(empty)
+
+if __name__ == "__main__":
+    main()
+    csv_filepath = './Results/2025-03-07_10-28-18_llama3-70b_2024AB1-Fine-Tuned-1-Shot.csv'
+    json_filepath = './Results/2025-03-07_10-28-18_llama3-70b-1-shot.json'
+    csv_to_json(csv_filepath, json_filepath)
