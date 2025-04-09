@@ -20,7 +20,7 @@ from typing import Optional
 import threading
 
 _bgem_semaphore = threading.BoundedSemaphore(1)
-_es_semaphore = threading.BoundedSemaphore(1)
+_es_semaphore = threading.BoundedSemaphore(10)
 _openai_client_semaphore = threading.BoundedSemaphore(2)
 
 os.environ.pop("http_proxy", None)
@@ -29,8 +29,70 @@ os.environ.pop("https_proxy", None)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-def escape_for_json(input_string):
-    return json.dumps(input_string)
+class ClientRotator:
+    def __init__(self, client_semaphore_pairs):
+        """
+        client_semaphore_pairs: 列表，元素为元组 (client, semaphore)
+        """
+        self.client_semaphore_pairs = client_semaphore_pairs
+        self.index = 0
+        self.lock = threading.Lock()  # 保证线程安全的轮询
+
+    def get_next(self):
+        """获取下一个客户端及其对应的信号量"""
+        with self.lock:
+            client, semaphore = self.client_semaphore_pairs[self.index]
+            self.index = (self.index + 1) % len(self.client_semaphore_pairs)
+            return client, semaphore
+
+
+def get_chat_completion(
+    model: str,
+    messages: list,
+    temperature: float = 0.0,
+    response_format: Optional[dict] = None,
+    seed: int = 90128538,
+    max_retries: int = 5,
+    retry_delay: int = 1,
+):
+    """ """
+    for attempt in range(max_retries + 1):
+        try:
+            request_params = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "seed": seed,
+            }
+
+            if response_format:
+                request_params["response_format"] = response_format
+
+            if enable_multiclient:
+                current_client, current_semaphore = client_rotator.get_next()
+                with current_semaphore:
+                    return current_client.chat.completions.create(**request_params)
+            else:
+                with _openai_client_semaphore:
+                    return client_openai.chat.completions.create(**request_params)
+
+        except APIError as e:
+            if e.status_code == 500 and attempt < max_retries:
+                print(f"服务器错误，第 {attempt+1} 次重试...")
+                time.sleep(retry_delay)
+            else:
+                raise
+        except APIConnectionError as e:
+            if attempt < max_retries:
+                print(f"连接异常，第 {attempt+1} 次重试...")
+                time.sleep(retry_delay)
+            else:
+                raise
+        except Exception as e:
+            print(e)
+            raise
+
+    raise RuntimeError(f"超过最大重试次数 {max_retries}")
 
 
 def run_elasticsearch_query(query, index="pubmed25_with_vector"):
@@ -60,49 +122,6 @@ def run_elasticsearch_query(query, index="pubmed25_with_vector"):
             results.append(result)
     print(f"docs found: {len(results)}")
     return results
-
-
-def get_chat_completion(
-    model: str,
-    messages: list,
-    temperature: float = 0.0,
-    response_format: Optional[dict] = None,
-    seed: int = 90128538,
-    max_retries: int = 5,
-    retry_delay: int = 1,
-):
-    """ """
-    for attempt in range(max_retries + 1):
-        try:
-            request_params = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "seed": seed,
-            }
-
-            if response_format:
-                request_params["response_format"] = response_format
-            with _openai_client_semaphore:
-                return client_openai.chat.completions.create(**request_params)
-
-        except APIError as e:
-            if e.status_code == 500 and attempt < max_retries:
-                print(f"服务器错误，第 {attempt+1} 次重试...")
-                time.sleep(retry_delay)
-            else:
-                raise
-        except APIConnectionError as e:
-            if attempt < max_retries:
-                print(f"连接异常，第 {attempt+1} 次重试...")
-                time.sleep(retry_delay)
-            else:
-                raise
-        except Exception as e:
-            print(e)
-            raise
-
-    raise RuntimeError(f"超过最大重试次数 {max_retries}")
 
 
 def create_query(
@@ -780,6 +799,11 @@ def parse_args():
         default=11434,
         help="Local port for API forwarding (1024-65535, default: 11434)",
     )
+    parser.add_argument(
+        "--multiclient",
+        action="store_true",
+        help="Enable multi-client mode, alternating between multiple OpenAI clients",
+    )
 
     return parser.parse_args()
 
@@ -790,14 +814,44 @@ def main():
     abstract_boost = args.abstract_boost
     title_boost = args.title_boost
 
-    forward_port = args.forward_port
-    # Initialize OpenAI client
-    global client_openai
-    client_openai = OpenAI(
-        api_key="ollama",
-        base_url=f"http://127.0.0.1:{str(forward_port)}/v1",
-        timeout=3000,
-    )
+    global enable_multiclient
+    enable_multiclient = args.multiclient
+    if enable_multiclient:
+        client_openai_1 = OpenAI(
+            api_key="ollama",
+            base_url=f"http://127.0.0.1:11435/v1",
+            timeout=3000,
+        )
+        client_openai_2 = OpenAI(
+            api_key="ollama",
+            base_url=f"http://127.0.0.1:11436/v1",
+            timeout=3000,
+        )
+        client_openai_3 = OpenAI(
+            api_key="ollama",
+            base_url=f"http://127.0.0.1:11437/v1",
+            timeout=3000,
+        )
+        semaphore_1 = threading.Semaphore(2)
+        semaphore_2 = threading.Semaphore(2)
+        semaphore_3 = threading.Semaphore(2)
+
+        global client_rotator
+        # client_rotator = ClientRotator(
+        #     [(client_openai_1, semaphore_1), (client_openai_2, semaphore_2)]
+        # )
+        client_rotator = ClientRotator(
+            [(client_openai_1, semaphore_1), (client_openai_2, semaphore_2), (client_openai_3, semaphore_3)]
+        )
+    else:
+        forward_port = args.forward_port
+        # Initialize OpenAI client
+        global client_openai
+        client_openai = OpenAI(
+            api_key="ollama",
+            base_url=f"http://127.0.0.1:{str(forward_port)}/v1",
+            timeout=3000,
+        )
 
     global embed_model
     embed_model = BGEM3FlagModel(r"/mnt/data/haoquan/model/bge-m3")
