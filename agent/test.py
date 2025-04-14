@@ -37,3 +37,7 @@ async def fetch_weather(city: str) -> dict[str, Any] | None:
         
 response = await fetch_weather('Beijing')
 print(response)
+
+'''
+{'coord': {'lon': 116.3972, 'lat': 39.9075}, 'weather': [{'id': 800, 'main': 'Clear', 'description': '晴', 'icon': '01d'}], 'base': 'stations', 'main': {'temp': 23.94, 'feels_like': 22.65, 'temp_min': 23.94, 'temp_max': 23.94, 'pressure': 1005, 'humidity': 10, 'sea_level': 1005, 'grnd_level': 1000}, 'visibility': 10000, 'wind': {'speed': 4.63, 'deg': 343, 'gust': 9.31}, 'clouds': {'all': 6}, 'dt': 1744612286, 'sys': {'type': 1, 'id': 9609, 'country': 'CN', 'sunrise': 1744580304, 'sunset': 1744627839}, 'timezone': 28800, 'id': 1816670, 'name': 'Beijing', 'cod': 200}
+'''
