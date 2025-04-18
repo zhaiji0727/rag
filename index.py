@@ -1,13 +1,3 @@
-#!/usr/bin/env python3
-"""
-优化后的 PubMed 文章处理脚本（适用于大批量文章，如30000篇）
-
-该版本使用 asyncio 及异步调用包装 BGEM3FlagModel.encode 实现嵌入请求，
-并使用 asyncio.to_thread 包装文件解析和存储操作。
-另外，在处理每个文件时，通过设置 max_parallel_batches 参数来控制每个文件内部并发批次的数量，
-以限制同时执行的嵌入请求。
-"""
-
 import os
 import sys
 import gzip
