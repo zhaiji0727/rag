@@ -14,7 +14,6 @@ import json
 import csv
 import subprocess
 import argparse
-from tqdm import tqdm
 from FlagEmbedding import BGEM3FlagModel
 from typing import Optional
 import threading
