@@ -1,3 +1,178 @@
+def generate_n_shot_examples_reranking(examples, n):
+    n_shot_examples = []
+    for example in examples[:n]:
+        for message in example["messages"]:
+            if message["role"] != "system":
+                n_shot_examples.append(message)
+    return n_shot_examples
+
+
+def rerank_snippets(examples, n, snippets, question: str, model: str) -> str:
+    numbered_snippets = [
+        {"id": idx, "text": snippet["text"]} for idx, snippet in enumerate(snippets)
+    ]
+    system_message = {
+        "role": "system",
+        "content": "You are BioASQ-GPT, an AI expert in question answering, research, and information retrieval in the biomedical domain.",
+    }
+    messages = [system_message]
+    few_shot_examples = generate_n_shot_examples_reranking(examples, n)
+    messages.extend(few_shot_examples)
+    user_message = {
+        "role": "user",
+        "content": f"""Given this question: '{question}' select the top 10 snippets that are most helpful for answering this question from
+    this list of snippets, rerank them by helpfulness: ```{numbered_snippets}``` return a json array of their ids called 'snippets'""",
+    }
+    messages.append(user_message)
+    # print("Prompt Messages:")
+    # print(messages)
+
+    # completion = client_openai.chat.completions.create(
+    #     model=model,
+    #     messages=messages,
+    #     temperature=0.0,
+    #     response_format={"type": "json_object"},
+    #     seed=90128538,
+    # )
+    # completion = get_chat_completion(
+    #     model=model, messages=messages, response_format={"type": "json_object"}
+    # )
+    # print("\n Completion:")
+    # print(completion)
+    # print("\n")
+    # if "deepseek" in model.lower():
+    #     answer = completion.choices[0].message.content.split("</think>")[-1]
+    # else:
+    #     answer = completion.choices[0].message.content
+    # json_response = find_extract_json(answer)
+    # json_response = find_extract_json(completion.choices[0].message.content)
+
+    # try:
+    #     snippets_reranked = json.loads(json_response)
+    #     snippets_idx = snippets_reranked["snippets"]
+    #     filtered_array = [snippets[i] for i in snippets_idx]
+    # except Exception as e:
+    # print(f"Error parsing response as json: {json_response}: {e}")
+    # traceback.print_exc()
+    # filtered_array = snippets
+
+    MAX_RETRIES = 3  # 最大重试次数
+    RETRY_INTERVAL = 3  # 重试间隔（秒）
+    for attempt in range(MAX_RETRIES + 1):  # 0~MAX_RETRIES 共 MAX_RETRIES+1 次尝试
+        try:
+            if attempt > 0:
+                random_seed = random.randint(0, 1000000)
+                completion = get_chat_completion(
+                    model=model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    seed=random_seed,
+                )
+            else:
+                completion = get_chat_completion(
+                    model=model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                )
+            if "deepseek" in model.lower():
+                answer = completion.choices[0].message.content.split("</think>")[-1]
+            else:
+                answer = completion.choices[0].message.content
+            json_response = find_extract_json(answer)
+
+            snippets_reranked = json.loads(json_response)
+            snippets_idx = snippets_reranked["snippets"]
+            filtered_array = [snippets[i] for i in snippets_idx]
+
+            break
+        except Exception as e:
+            print(f"第 {attempt + 1} 次尝试失败: {str(e)}")
+            traceback.print_exc()
+            if attempt + 1 == MAX_RETRIES:
+                print("⚠️ 达到最大重试次数，启用降级方案")
+                return snippets
+            else:
+                print(f"⏳ {RETRY_INTERVAL}秒后重试...")
+                time.sleep(RETRY_INTERVAL)
+
+    return filtered_array
+
+
+def save_state(data, file_path):
+    with open(file_path, "wb") as f:
+        pickle.dump(data, f)
+        print(f"Saved state to: {file_path}")
+
+
+def load_state(file_path):
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                print(f"Loaded state from: {file_path}")
+                return pickle.load(f)
+    except EOFError:
+        return None
+    return None
+
+
+def read_jsonl_file(file_path):
+    examples = []
+    with open(file_path, "r", encoding="utf-8") as file:
+        for line in file:
+            examples.append(json.loads(line))
+    return examples
+
+
+def extract_text_wrapped_in_tags(input_string):
+    pattern = "##(.*?)##"
+    match = re.search(pattern, input_string, re.DOTALL)
+    if match:
+        extracted_text = match.group(1).replace("\n", "")
+        return extracted_text
+    else:
+        return "ERROR"
+
+
+def reorder_articles_by_snippet_sequence(relevant_article_ids, snippets):
+    ordered_article_ids = []
+    mentioned_article_ids = set()
+
+    for snippet in snippets:
+        document_id = snippet["document"]
+        if (
+            document_id in relevant_article_ids
+            and document_id not in mentioned_article_ids
+        ):
+            ordered_article_ids.append(document_id)
+            mentioned_article_ids.add(document_id)
+
+    for article_id in relevant_article_ids:
+        if article_id not in mentioned_article_ids:
+            ordered_article_ids.append(article_id)
+
+    return ordered_article_ids
+
+
+def get_relevant_snippets(examples, n, articles, question, model_name):
+    processed_articles = []
+    # for article in tqdm(articles, desc="Extracting relevant snippets."):
+    for article in articles:
+        snippets = extract_relevant_snippets_few_shot(
+            examples, n, article, question, model_name
+        )
+        if snippets:
+            article["snippets"] = snippets
+            processed_articles.append(article)
+    return processed_articles
+
+
+def encode_texts(texts):
+    with _bgem_semaphore:
+        return embed_model.encode(
+            texts, return_dense=True, return_colbert_vecs=False, return_sparse=False
+        )["dense_vecs"]
+
+
 def process_question(
     question,
     query_examples,
@@ -247,7 +422,7 @@ def parse_args():
         "--multiclient",
         action="store_true",
         help="Enable multi-client mode, alternating between multiple OpenAI clients",
-    )   
+    )
     parser.add_argument(
         "--pickle_file",
         type=str,
@@ -314,10 +489,10 @@ def main():
         client_rotator = ClientRotator(
             [
                 # (client_openai_1, semaphore_1),
-                (client_openai_2, semaphore_2),
-                (client_openai_3, semaphore_3),
-                # (client_openai_4, semaphore_4),
-                # (client_openai_5, semaphore_5),
+                # (client_openai_2, semaphore_2),
+                # (client_openai_3, semaphore_3),
+                (client_openai_4, semaphore_4),
+                (client_openai_5, semaphore_5),
                 # (client_openai_6, semaphore_6),
             ]
         )
@@ -350,7 +525,7 @@ def main():
             if "/" in model_name or ":" in model_name
             else model_name
         )
-        pickl_file = f"/home/samsung/haoquan/bioasq2024-main/02_12B/Batch1/PhaseA/{timestamp}-{pickl_name}-{n_shot}-shot.pkl"
+        pickl_file = f"/home/samsung/haoquan/bioasq2024-main/02_12B/Batch1/PhaseA/pkl_{timestamp}-{pickl_name}-{n_shot}-shot.pkl"
     else:
         pickl_file = args.pickle_file
 
