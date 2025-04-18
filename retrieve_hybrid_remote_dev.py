@@ -20,7 +20,7 @@ from typing import Optional
 import threading
 
 _bgem_semaphore = threading.BoundedSemaphore(1)
-_es_semaphore = threading.BoundedSemaphore(1)
+_es_semaphore = threading.BoundedSemaphore(5)
 _openai_client_semaphore = threading.BoundedSemaphore(2)
 
 os.environ.pop("http_proxy", None)
@@ -98,48 +98,56 @@ def get_chat_completion(
 def run_elasticsearch_query(query, index="pubmed25_with_vector"):
     MAX_RETRIES = 3  # 最大重试次数
     QUERY_INTERVAL = 3  # 执行间隔（秒）
-    
+
     es = Elasticsearch(
         "http://109.105.34.64:9200", verify_certs=False, request_timeout=3000
     )
 
-    if isinstance(query, str) and not isinstance(query, dict):
-        query_dict = json.loads(query)
+    if isinstance(query, str):
+        try:
+            query_dict = json.loads(query)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON query string: {str(e)}")
     else:
         query_dict = query
-        
-    retry_count = 0
-    while retry_count <= MAX_RETRIES:
+
+    for retry in range(MAX_RETRIES + 1):  # 0~MAX_RETRIES 共 MAX_RETRIES+1 次尝试
         try:
             with _es_semaphore:  # 信号量控制并发
-                print("\nRunning ES query:".ljust(40, '-'))
+                print("\nRunning ES query:".ljust(40, "-"))
                 print(f"Query: {query_dict}\n")
                 response = es.search(index=index, **query_dict)
-                
+
                 # 处理查询结果
                 results = []
                 if response["hits"]["hits"]:
                     for hit in response["hits"]["hits"]:
-                        results.append({
-                            "id": f"http://www.ncbi.nlm.nih.gov/pubmed/{hit['_id']}",
-                            "title": hit["_source"].get("title", "No title available"),
-                            "abstract": hit["_source"].get("abstract", "No abstract available")
-                        })
+                        results.append(
+                            {
+                                "id": f"http://www.ncbi.nlm.nih.gov/pubmed/{hit['_id']}",
+                                "title": hit["_source"].get(
+                                    "title", "No title available"
+                                ),
+                                "abstract": hit["_source"].get(
+                                    "abstract", "No abstract available"
+                                ),
+                            }
+                        )
                 print(f"Documents found: {len(results)}")
-                time.sleep(QUERY_INTERVAL)  # 成功后的间隔
-                return results  # 直接返回处理后的结果
+                time.sleep(QUERY_INTERVAL)
+                return results
 
         except Exception as e:
-            if retry_count >= MAX_RETRIES:
-                # raise RuntimeError("Maximum retries exceeded") from e 
+            print(f"Query failed (attempt {retry + 1}/{MAX_RETRIES}): {str(e.info)}")
+            if retry == MAX_RETRIES:  # 最后一次尝试失败后直接返回
                 return []
-            print(f"Query failed (attempt {retry_count + 1}/{MAX_RETRIES}): {str(e)}")
-            retry_count += 1
-            time.sleep(60)  # 重试前的间隔
+            print("Sleeping 30s...")
+            time.sleep(30)
 
-    return []  # 理论不可达代码（因重试失败时会先抛出异常）
+    return []  # 冗余返回，实际不会执行到这里
 
-'''
+
+"""
 def create_query(
     query_string: str,
     query_vector=None,
@@ -190,7 +198,8 @@ def create_query(
 
     query["size"] = size
     return query
-'''
+"""
+
 
 def create_query(
     query_string: str,
@@ -204,20 +213,57 @@ def create_query(
         "query": {
             "script_score": {
                 # 动态选择主查询：text_boost > 0 时用 query_string，否则用 match_all
-                "query": {
-                    "query_string": {"query": query_string}
-                } if text_boost != 0 else {"match_all": {}},
+                "query": (
+                    {
+                        # "query_string": {"query": query_string}
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": {"query": query_string}
+                                },  # 原有查询条件
+                                {"exists": {"field": "abstract_vector"}},
+                                {"exists": {"field": "title_vector"}},
+                            ]
+                        }
+                    }
+                    if text_boost != 0
+                    else {"match_all": {}}
+                ),
+                # "script": {
+                #     "source": """
+                #         double score = 0;
+                #         if (params.text_boost > 0) {
+                #             score = _score * params.text_boost;
+                #         }
+                #         if (params.abstract_boost > 0) {
+                #             score += cosineSimilarity(params.query_vector, 'abstract_vector') * params.abstract_boost;
+                #         }
+                #         if (params.title_boost > 0) {
+                #             score += cosineSimilarity(params.query_vector, 'title_vector') * params.title_boost;
+                #         }
+                #         return score;
+                #     """,
                 "script": {
                     "source": """
                         double score = 0;
                         if (params.text_boost > 0) {
                             score = _score * params.text_boost;
                         }
-                        if (params.abstract_boost > 0) {
-                            score += cosineSimilarity(params.query_vector, 'abstract_vector') * params.abstract_boost;
+                        // 检查 abstract_vector 是否存在且非空
+                        if (params.abstract_boost > 0 
+                            && doc.containsKey('abstract_vector') 
+                            && !'abstract_vector'.empty) {
+                            score += cosineSimilarity(
+                                params.query_vector, 'abstract_vector'
+                            ) * params.abstract_boost;
                         }
-                        if (params.title_boost > 0) {
-                            score += cosineSimilarity(params.query_vector, 'title_vector') * params.title_boost;
+                        // 检查 title_vector 是否存在且非空
+                        if (params.title_boost > 0 
+                            && doc.containsKey('title_vector') 
+                            && !'title_vector'.empty) {
+                            score += cosineSimilarity(
+                                params.query_vector, 'title_vector'
+                            ) * params.title_boost;
                         }
                         return score;
                     """,
@@ -226,12 +272,12 @@ def create_query(
                         "text_boost": text_boost,
                         "abstract_boost": abstract_boost,
                         "title_boost": title_boost,
-                    }
-                }
+                    },
+                },
             }
         },
         "timeout": "300s",
-        "size": size
+        "size": size,
     }
 
     # 如果没有向量查询且 text_boost=0，回退到纯文本查询（或 match_all）
@@ -239,7 +285,7 @@ def create_query(
         query["query"] = {"match_all": {}}
     elif query_vector is None:
         query["query"] = {"query_string": {"query": query_string}}
-    
+
     return query
 
 
@@ -260,7 +306,7 @@ def rewrite_original_query(query: str, model: str):
         
         Please generate a query string for the following biomedical question and wrap the final query in ## tags:
         '{query}'
-        """
+        """,
     }
     messages = [system_message, user_message]
     completion = get_chat_completion(model=model, messages=messages)
@@ -271,6 +317,7 @@ def rewrite_original_query(query: str, model: str):
         answer = completion.choices[0].message.content
 
     return answer
+
 
 def expand_query_few_shot(df_prior, n, question: str, model: str):
     messages = generate_n_shot_examples_expansion(df_prior, n)
@@ -696,7 +743,7 @@ def process_question(
         filtered_articles_ids = []
         reordered_articles_ids = []
         relevant_snippets = []
-        
+
         if abstract_boost != 0.0 or title_boost != 0.0:
             # add rewrite part
             rewrite_completion = rewrite_original_query(question["body"], model_name)
@@ -711,8 +758,7 @@ def process_question(
         question_id = question["id"]
         print(f"Processing question {question_id}")
         wiki_context = ""
-    
-        
+
         completion = expand_query_few_shot(
             query_examples, n_shot, question["body"], model_name
         )
@@ -1010,7 +1056,7 @@ def main():
         embed_model = BGEM3FlagModel(r"/mnt/data/haoquan/model/bge-m3")
     else:
         embed_model = None
-        print('Embed model not initialized~')
+        print("Embed model not initialized~")
 
     # model_name = 'llama3.2:3B'
     # model_name = "mistral"
@@ -1075,7 +1121,7 @@ def main():
     start_time = time.time()
 
     # Parallel run
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_question = {
             executor.submit(
                 process_question,
