@@ -52,7 +52,7 @@ def get_chat_completion(
     messages: list,
     temperature: float = 0.0,
     response_format: Optional[dict] = None,
-    seed: int = 90128538
+    seed: int = 90128538,
 ):
     MAX_RETRIES = 3  # 最大重试次数
     RETRY_INTERVAL = 3  # 重试间隔（秒）
@@ -521,7 +521,7 @@ def extract_relevant_snippets_few_shot(
     #     response_format={"type": "json_object"},
     #     seed=90128538,  # 90128538
     # )
-    
+
     # print("\n Completion:")
     # print(completion)
     # print("\n")
@@ -543,7 +543,7 @@ def extract_relevant_snippets_few_shot(
     # except Exception as e:
     #     print(f"Error getting snippets from {sentences}: {e}")
     #     snippets = []
-    
+
     MAX_RETRIES = 3  # 最大重试次数
     RETRY_INTERVAL = 3  # 重试间隔（秒）
     for attempt in range(MAX_RETRIES + 1):  # 0~MAX_RETRIES 共 MAX_RETRIES+1 次尝试
@@ -551,23 +551,28 @@ def extract_relevant_snippets_few_shot(
             if attempt > 0:
                 random_seed = random.randint(0, 1000000)
                 completion = get_chat_completion(
-                    model=model, messages=messages, response_format={"type": "json_object"}, seed=random_seed
+                    model=model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    seed=random_seed,
                 )
             else:
                 completion = get_chat_completion(
-                    model=model, messages=messages, response_format={"type": "json_object"}
+                    model=model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
                 )
             if "deepseek" in model.lower():
                 answer = completion.choices[0].message.content.split("</think>")[-1]
             else:
                 answer = completion.choices[0].message.content
-            
+
             # JSON 解析与校验
             json_response = find_extract_json(answer)
             sentences = json.loads(json_response)
-            
+
             snippets = generate_snippets_from_sentences(article, sentences["snippets"])
-            
+
             break
         except Exception as e:
             print(f"第 {attempt + 1} 次尝试失败: {str(e)}")
@@ -579,7 +584,6 @@ def extract_relevant_snippets_few_shot(
             else:
                 print(f"⏳ {RETRY_INTERVAL}秒后重试...")
                 time.sleep(RETRY_INTERVAL)
-
 
     return snippets
 
