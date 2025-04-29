@@ -287,8 +287,46 @@ def create_query(
 
     return query
 
+def validate_es_query(query_string: str, index="pubmed25_with_vector") -> bool:
+    """
+    检查查询字符串是否符合 Elasticsearch 语法
+    """
+    if query_string.strip() == "ERROR":
+        return False
+    
+    es = Elasticsearch(
+        "http://109.105.34.64:9200", verify_certs=False, request_timeout=3000
+    )
+    try:
+        # 将查询字符串包装成 Elasticsearch 的 query_string 查询
+        validation = es.indices.validate_query(
+            index=index,
+            body={
+                "query": {
+                    "query_string": {
+                        "query": query_string,
+                        "default_field": "*"
+                    }
+                }
+            },
+            explain=True
+        )
+        if validation.get("valid", False):
+            return True
+        else:
+            # 提取错误详细信息
+            explanations = validation.get("explanations", [])
+            for explanation in explanations:
+                if "error" in explanation:
+                    print(f"❌ 查询语法错误: {query_string}")
+                    print(f"错误详情: {explanation['error']}")
+            return False
+    
+    except Exception as e:
+        return False
 
-def rewrite_original_query(query: str, model: str):
+
+def rewrite_original_query(query: str, model: str, seed: int = None):
     system_message = {
         "role": "system",
         "content": "You are BioASQ-GPT, an AI expert in question answering, research, and information retrieval in the biomedical domain.",
@@ -308,7 +346,11 @@ def rewrite_original_query(query: str, model: str):
         """,
     }
     messages = [system_message, user_message]
-    completion = get_chat_completion(model=model, messages=messages)
+    completion = (
+        get_chat_completion(model=model, messages=messages, seed=seed)
+        if seed is not None
+        else get_chat_completion(model=model, messages=messages)
+    )
 
     if "deepseek" in model.lower():
         answer = completion.choices[0].message.content.split("</think>")[-1]
@@ -318,7 +360,7 @@ def rewrite_original_query(query: str, model: str):
     return answer
 
 
-def expand_query_few_shot(df_prior, n, question: str, model: str):
+def expand_query_few_shot(df_prior, n, question: str, model: str, seed: int = None):
     messages = generate_n_shot_examples_expansion(df_prior, n)
     user_message = {
         "role": "user",
@@ -361,7 +403,11 @@ def expand_query_few_shot(df_prior, n, question: str, model: str):
     #     temperature=0.0,  # randomness of completion
     #     seed=90128538,
     # )
-    completion = get_chat_completion(model=model, messages=messages)
+    completion = (
+        get_chat_completion(model=model, messages=messages, seed=seed)
+        if seed is not None
+        else get_chat_completion(model=model, messages=messages)
+    )
     # answer = completion.choices[0].message.content
     if "deepseek" in model.lower():
         answer = completion.choices[0].message.content.split("</think>")[-1]
@@ -627,3 +673,12 @@ def generate_snippets_from_sentences(article, sentences):
             pass
 
     return snippets
+
+
+def generate_n_shot_examples_reranking(examples, n):
+    n_shot_examples = []
+    for example in examples[:n]:
+        for message in example["messages"]:
+            if message["role"] != "system":
+                n_shot_examples.append(message)
+    return n_shot_examples
