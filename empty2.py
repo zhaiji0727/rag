@@ -1,12 +1,3 @@
-def generate_n_shot_examples_reranking(examples, n):
-    n_shot_examples = []
-    for example in examples[:n]:
-        for message in example["messages"]:
-            if message["role"] != "system":
-                n_shot_examples.append(message)
-    return n_shot_examples
-
-
 def rerank_snippets(examples, n, snippets, question: str, model: str) -> str:
     numbered_snippets = [
         {"id": idx, "text": snippet["text"]} for idx, snippet in enumerate(snippets)
@@ -192,26 +183,48 @@ def process_question(
         reordered_articles_ids = []
         relevant_snippets = []
 
+        question_id = question["id"]
+        print(f"Processing question {question_id}")
+
         if abstract_boost != 0.0 or title_boost != 0.0:
             # add rewrite part
             rewrite_completion = rewrite_original_query(question["body"], model_name)
             rewrite_query_string = extract_text_wrapped_in_tags(rewrite_completion)
             # print(f'query: {question["body"]}\nrewrite query: {rewrite_query_string}')
+            
+            attempt = 0
+            MAX_RETRIES = 3
+            while query_string == "ERROR" and attempt < MAX_RETRIES:
+                # 重试时传入之前生成的random_seed
+                random_seed = random.randint(0, 1000000)
+                rewrite_completion = rewrite_original_query(question["body"], model_name, random_seed)
+                rewrite_query_string = extract_text_wrapped_in_tags(rewrite_completion)
+                attempt += 1
 
             # query_vector = encode_texts(question["body"])
             query_vector = encode_texts(rewrite_query_string)
+            # query_vector = encode_texts(question["body"])
         else:
             query_vector = None
 
-        question_id = question["id"]
-        print(f"Processing question {question_id}")
         wiki_context = ""
 
         completion = expand_query_few_shot(
             query_examples, n_shot, question["body"], model_name
         )
-
         query_string = extract_text_wrapped_in_tags(completion)
+
+        attempt = 0
+        MAX_RETRIES = 3
+        while (query_string == "ERROR" or not validate_es_query(query_string)) and attempt < MAX_RETRIES:
+            # 重试时传入之前生成的random_seed
+            random_seed = random.randint(0, 1000000)
+            completion = expand_query_few_shot(
+                query_examples, max(0, n_shot - attempt - 1), question["body"], model_name, seed=random_seed
+            )
+            query_string = extract_text_wrapped_in_tags(completion)
+            attempt += 1
+
         query = create_query(
             query_string, query_vector, text_boost, abstract_boost, title_boost
         )
@@ -409,8 +422,8 @@ def parse_args():
         "--model",
         type=str,
         default="mistral",
-        choices=["mistral", "llama3-70b", "deepseek-r1:70b-q80"],
-        help="Select model version (options: mistral, llama3-70b，deepseek-r1:70b-q80)",
+        choices=["mistral", "llama3-70b", "deepseek-r1:70b-q80", "deepseek-r1:70b", "glm4:32b"],
+        help="Select model version (options: mistral, llama3-70b，deepseek-r1:70b-q80, deepseek-r1:70b, glm4:32b)",
     )
     parser.add_argument(
         "--forward_port",
@@ -441,70 +454,131 @@ def main():
 
     global enable_multiclient
     enable_multiclient = args.multiclient
+    # enable_multiclient = False #######################################################################
     if enable_multiclient:
-        client_openai_1 = OpenAI(
-            api_key="ollama",
-            base_url=f"http://127.0.0.1:11435/v1",
-            timeout=3000,
-        )
-        client_openai_2 = OpenAI(
-            api_key="ollama",
-            base_url=f"http://127.0.0.1:11436/v1",
-            timeout=3000,
-        )
-        client_openai_3 = OpenAI(
-            api_key="ollama",
-            base_url=f"http://127.0.0.1:11437/v1",
-            timeout=3000,
-        )
-        client_openai_4 = OpenAI(
-            api_key="ollama",
-            base_url=f"http://127.0.0.1:11438/v1",
-            timeout=3000,
-        )
-        client_openai_5 = OpenAI(
-            api_key="ollama",
-            base_url=f"http://127.0.0.1:11439/v1",
-            timeout=3000,
-        )
-        client_openai_6 = OpenAI(
-            api_key="ollama",
-            base_url=f"http://127.0.0.1:11440/v1",
-            timeout=3000,
-        )
-        semaphore_1 = threading.Semaphore(2)
-        semaphore_2 = threading.Semaphore(2)
-        semaphore_3 = threading.Semaphore(2)
-        semaphore_4 = threading.Semaphore(2)
-        semaphore_5 = threading.Semaphore(2)
-        semaphore_6 = threading.Semaphore(2)
+        # client_openai_1 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11435/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_2 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11436/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_3 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11437/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_4 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11438/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_5 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11439/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_6 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11440/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_7 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11441/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_8 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11442/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_9 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11443/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_10 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11444/v1",
+        #     timeout=3000,
+        # )
+        # semaphore_1 = threading.Semaphore(2)
+        # semaphore_2 = threading.Semaphore(2)
+        # semaphore_3 = threading.Semaphore(2)
+        # semaphore_4 = threading.Semaphore(2)
+        # semaphore_5 = threading.Semaphore(2)
+        # semaphore_6 = threading.Semaphore(2)
+        # semaphore_7 = threading.Semaphore(2)
+        # semaphore_8 = threading.Semaphore(2)
+        # semaphore_9 = threading.Semaphore(2)
+        # semaphore_10 = threading.Semaphore(2)
+        # global client_rotator
+        # # client_rotator = ClientRotator(
+        # #     [(client_openai_1, semaphore_1), (client_openai_2, semaphore_2)]
+        # # )
+        # # client_rotator = ClientRotator(
+        # #     [(client_openai_1, semaphore_1), (client_openai_2, semaphore_2), (client_openai_3, semaphore_3)]
+        # # )
+        # client_rotator = ClientRotator(
+        #     [
+        #         (client_openai_1, semaphore_1),
+        #         (client_openai_2, semaphore_2),
+        #         (client_openai_3, semaphore_3),
+        #         (client_openai_4, semaphore_4),
+        #         (client_openai_5, semaphore_5),
+        #         (client_openai_6, semaphore_6),
+        #         (client_openai_7, semaphore_7),
+        #         (client_openai_8, semaphore_8),
+        #         (client_openai_9, semaphore_9),
+        #         (client_openai_10, semaphore_10),
+        #     ]
+        # )
+        
+        # 配置参数
+        base_port = 11435  # 起始端口
+        num_clients = 2    # 客户端数量
+        semaphore_value = 2 # 每个信号量的初始值
 
+        # 智能生成端口列表
+        ports = range(base_port, base_port + num_clients)
+        
+        # 批量创建客户端
+        clients = [
+            OpenAI(
+                api_key="ollama",
+                base_url=f"http://127.0.0.1:{port}/v1",
+                timeout=3000,
+            )
+            for port in ports
+        ]
+        
+        # 批量创建信号量
+        semaphores = [threading.Semaphore(semaphore_value) for _ in ports]
+        
+        # 组合客户端与信号量
         global client_rotator
-        # client_rotator = ClientRotator(
-        #     [(client_openai_1, semaphore_1), (client_openai_2, semaphore_2)]
-        # )
-        # client_rotator = ClientRotator(
-        #     [(client_openai_1, semaphore_1), (client_openai_2, semaphore_2), (client_openai_3, semaphore_3)]
-        # )
-        client_rotator = ClientRotator(
-            [
-                # (client_openai_1, semaphore_1),
-                # (client_openai_2, semaphore_2),
-                # (client_openai_3, semaphore_3),
-                (client_openai_4, semaphore_4),
-                (client_openai_5, semaphore_5),
-                # (client_openai_6, semaphore_6),
-            ]
-        )
+        client_rotator = ClientRotator(list(zip(clients, semaphores)))
+        
     else:
         forward_port = args.forward_port
         # Initialize OpenAI client
         global client_openai
-        client_openai = OpenAI(
-            api_key="ollama",
-            base_url=f"http://127.0.0.1:{str(forward_port)}/v1",
-            timeout=3000,
-        )
+        if forward_port == 11434:
+            client_openai = OpenAI(
+                api_key="ollama",
+                base_url="http://localhost:11434/v1",
+                timeout=3000,
+            )
+        else:
+            client_openai = OpenAI(
+                api_key="ollama",
+                base_url=f"http://127.0.0.1:{str(forward_port)}/v1",
+                timeout=3000,
+            )
 
     global embed_model
     if abstract_boost != 0.0 or title_boost != 0.0:
