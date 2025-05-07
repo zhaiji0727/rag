@@ -14,13 +14,13 @@ import json
 import csv
 import subprocess
 import argparse
-from tqdm import tqdm
 from FlagEmbedding import BGEM3FlagModel
 from typing import Optional
 import threading
+import random
 
 _bgem_semaphore = threading.BoundedSemaphore(1)
-_es_semaphore = threading.BoundedSemaphore(10)
+_es_semaphore = threading.BoundedSemaphore(5)
 _openai_client_semaphore = threading.BoundedSemaphore(2)
 
 os.environ.pop("http_proxy", None)
@@ -52,11 +52,10 @@ def get_chat_completion(
     temperature: float = 0.0,
     response_format: Optional[dict] = None,
     seed: int = 90128538,
-    max_retries: int = 5,
-    retry_delay: int = 1,
 ):
-    """ """
-    for attempt in range(max_retries + 1):
+    MAX_RETRIES = 3  # 最大重试次数
+    RETRY_INTERVAL = 3  # 重试间隔（秒）
+    for attempt in range(MAX_RETRIES + 1):
         try:
             request_params = {
                 "model": model,
@@ -77,60 +76,84 @@ def get_chat_completion(
                     return client_openai.chat.completions.create(**request_params)
 
         except APIError as e:
-            if e.status_code == 500 and attempt < max_retries:
+            if e.status_code == 500 and attempt < MAX_RETRIES:
                 print(f"服务器错误，第 {attempt+1} 次重试...")
-                time.sleep(retry_delay)
+                time.sleep(RETRY_INTERVAL)
             else:
                 raise
         except APIConnectionError as e:
-            if attempt < max_retries:
+            if attempt < MAX_RETRIES:
                 print(f"连接异常，第 {attempt+1} 次重试...")
-                time.sleep(retry_delay)
+                time.sleep(RETRY_INTERVAL)
             else:
                 raise
         except Exception as e:
             print(e)
             raise
 
-    raise RuntimeError(f"超过最大重试次数 {max_retries}")
+    raise RuntimeError(f"超过最大重试次数 {MAX_RETRIES}")
 
 
 def run_elasticsearch_query(query, index="pubmed25_with_vector"):
+    MAX_RETRIES = 3  # 最大重试次数
+    RETRY_INTERVAL = 3  # 执行间隔（秒）
+
     es = Elasticsearch(
         "http://109.105.34.64:9200", verify_certs=False, request_timeout=3000
     )
 
-    if isinstance(query, str) and not isinstance(query, dict):
-        query_dict = json.loads(query)
+    if isinstance(query, str):
+        try:
+            query_dict = json.loads(query)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON query string: {str(e)}")
     else:
         query_dict = query
 
-    with _es_semaphore:
-        print("\n running es query:")
-        print(query_dict)
-        print("\n")
-        response = es.search(index=index, body=query_dict)
+    for attempt in range(MAX_RETRIES + 1):  # 0~MAX_RETRIES 共 MAX_RETRIES+1 次尝试
+        try:
+            with _es_semaphore:  # 信号量控制并发
+                print("\nRunning ES query:".ljust(40, "-"))
+                print(f"Query: {query_dict}\n")
+                response = es.search(index=index, **query_dict)
 
-    results = []
-    if response["hits"]["hits"]:
-        for hit in response["hits"]["hits"]:
-            result = {
-                "id": "http://www.ncbi.nlm.nih.gov/pubmed/" + str(hit["_id"]),
-                "title": hit["_source"].get("title", "No title available"),
-                "abstract": hit["_source"].get("abstract", "No abstract available"),
-            }
-            results.append(result)
-    print(f"docs found: {len(results)}")
-    return results
+                # 处理查询结果
+                results = []
+                if response["hits"]["hits"]:
+                    for hit in response["hits"]["hits"]:
+                        results.append(
+                            {
+                                "id": f"http://www.ncbi.nlm.nih.gov/pubmed/{hit['_id']}",
+                                "title": hit["_source"].get(
+                                    "title", "No title available"
+                                ),
+                                "abstract": hit["_source"].get(
+                                    "abstract", "No abstract available"
+                                ),
+                            }
+                        )
+                print(f"Documents found: {len(results)}")
+                time.sleep(RETRY_INTERVAL)
+                return results
+
+        except Exception as e:
+            print(f"Query failed (attempt {attempt + 1}/{MAX_RETRIES}): {str(e.info)}")
+            if attempt + 1 == MAX_RETRIES:  # 最后一次尝试失败后直接返回
+                return []
+            print("Sleeping 10s...")
+            time.sleep(10)
+
+    return []  # 冗余返回，实际不会执行到这里
 
 
+"""
 def create_query(
     query_string: str,
     query_vector=None,
     text_boost=1.0,
     abstract_boost=0.0,
     title_boost=0.0,
-    size=30,
+    size=20,
 ):
     query = {}
     bool_should = []
@@ -174,9 +197,170 @@ def create_query(
 
     query["size"] = size
     return query
+"""
 
 
-def expand_query_few_shot(df_prior, n, question: str, model: str):
+def create_query(
+    query_string: str,
+    query_vector=None,
+    text_boost=1.0,
+    abstract_boost=0.0,
+    title_boost=0.0,
+    size=20,
+):
+    query = {
+        "query": {
+            "script_score": {
+                # 动态选择主查询：text_boost > 0 时用 query_string，否则用 match_all
+                "query": (
+                    {
+                        # "query_string": {"query": query_string}
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": {"query": query_string}
+                                },  # 原有查询条件
+                                {"exists": {"field": "abstract_vector"}},
+                                {"exists": {"field": "title_vector"}},
+                            ]
+                        }
+                    }
+                    if text_boost != 0
+                    else {"match_all": {}}
+                ),
+                # "script": {
+                #     "source": """
+                #         double score = 0;
+                #         if (params.text_boost > 0) {
+                #             score = _score * params.text_boost;
+                #         }
+                #         if (params.abstract_boost > 0) {
+                #             score += cosineSimilarity(params.query_vector, 'abstract_vector') * params.abstract_boost;
+                #         }
+                #         if (params.title_boost > 0) {
+                #             score += cosineSimilarity(params.query_vector, 'title_vector') * params.title_boost;
+                #         }
+                #         return score;
+                #     """,
+                "script": {
+                    "source": """
+                        double score = 0;
+                        if (params.text_boost > 0) {
+                            score = _score * params.text_boost;
+                        }
+                        // 检查 abstract_vector 是否存在且非空
+                        if (params.abstract_boost > 0 
+                            && doc.containsKey('abstract_vector') 
+                            && !'abstract_vector'.empty) {
+                            score += cosineSimilarity(
+                                params.query_vector, 'abstract_vector'
+                            ) * params.abstract_boost;
+                        }
+                        // 检查 title_vector 是否存在且非空
+                        if (params.title_boost > 0 
+                            && doc.containsKey('title_vector') 
+                            && !'title_vector'.empty) {
+                            score += cosineSimilarity(
+                                params.query_vector, 'title_vector'
+                            ) * params.title_boost;
+                        }
+                        return score;
+                    """,
+                    "params": {
+                        "query_vector": query_vector,
+                        "text_boost": text_boost,
+                        "abstract_boost": abstract_boost,
+                        "title_boost": title_boost,
+                    },
+                },
+            }
+        },
+        "timeout": "300s",
+        "size": size,
+    }
+
+    # 如果没有向量查询且 text_boost=0，回退到纯文本查询（或 match_all）
+    if query_vector is None and text_boost == 0:
+        query["query"] = {"match_all": {}}
+    elif query_vector is None:
+        query["query"] = {"query_string": {"query": query_string}}
+
+    return query
+
+def validate_es_query(query_string: str, index="pubmed25_with_vector") -> bool:
+    """
+    检查查询字符串是否符合 Elasticsearch 语法
+    """
+    if query_string.strip() == "ERROR":
+        return False
+    
+    es = Elasticsearch(
+        "http://109.105.34.64:9200", verify_certs=False, request_timeout=3000
+    )
+    try:
+        # 将查询字符串包装成 Elasticsearch 的 query_string 查询
+        validation = es.indices.validate_query(
+            index=index,
+            body={
+                "query": {
+                    "query_string": {
+                        "query": query_string,
+                        "default_field": "*"
+                    }
+                }
+            },
+            explain=True
+        )
+        if validation.get("valid", False):
+            return True
+        else:
+            # 提取错误详细信息
+            explanations = validation.get("explanations", [])
+            for explanation in explanations:
+                if "error" in explanation:
+                    print(f"❌ 查询语法错误: {query_string}")
+                    print(f"错误详情: {explanation['error']}")
+            return False
+    
+    except Exception as e:
+        return False
+
+
+def rewrite_original_query(query: str, model: str, seed: int = None):
+    system_message = {
+        "role": "system",
+        "content": "You are BioASQ-GPT, an AI expert in question answering, research, and information retrieval in the biomedical domain.",
+    }
+    user_message = {
+        "role": "user",
+        "content": f"""
+        Rewrite the provided medical-related user query into one alternative version while preserving the original intent and meaning. 
+        The rewritten query should maintain clinical accuracy, use appropriate medical terminology, and enhance clarity for improved information retrieval. 
+        Ensure the restructured query reflects natural healthcare communication patterns without altering diagnostic or treatment-related semantics.
+
+        Example input query: "What are the early warning signs of myocardial infarction?" 
+        Example output: What clinical symptoms typically present as initial indicators of a heart attack, and how do they manifest in different patient demographics?
+        
+        Please generate a query string for the following biomedical question and wrap the final query in ## tags:
+        '{query}'
+        """,
+    }
+    messages = [system_message, user_message]
+    completion = (
+        get_chat_completion(model=model, messages=messages, seed=seed)
+        if seed is not None
+        else get_chat_completion(model=model, messages=messages)
+    )
+
+    if "deepseek" in model.lower():
+        answer = completion.choices[0].message.content.split("</think>")[-1]
+    else:
+        answer = completion.choices[0].message.content
+
+    return answer
+
+
+def expand_query_few_shot(df_prior, n, question: str, model: str, seed: int = None):
     messages = generate_n_shot_examples_expansion(df_prior, n)
     user_message = {
         "role": "user",
@@ -219,8 +403,16 @@ def expand_query_few_shot(df_prior, n, question: str, model: str):
     #     temperature=0.0,  # randomness of completion
     #     seed=90128538,
     # )
-    completion = get_chat_completion(model=model, messages=messages)
-    answer = completion.choices[0].message.content
+    completion = (
+        get_chat_completion(model=model, messages=messages, seed=seed)
+        if seed is not None
+        else get_chat_completion(model=model, messages=messages)
+    )
+    # answer = completion.choices[0].message.content
+    if "deepseek" in model.lower():
+        answer = completion.choices[0].message.content.split("</think>")[-1]
+    else:
+        answer = completion.choices[0].message.content
     # print("\n Completion:")
     # print(answer)
     # print("\n")
@@ -314,7 +506,11 @@ def refine_query_with_no_results(question, original_query, model):
     #     seed=90128538,
     # )
     completion = get_chat_completion(model=model, messages=messages)
-    answer = completion.choices[0].message.content
+    # answer = completion.choices[0].message.content
+    if "deepseek" in model.lower():
+        answer = completion.choices[0].message.content.split("</think>")[-1]
+    else:
+        answer = completion.choices[0].message.content
     # print("\n Completion:")
     # print(answer)
     # print("\n")
@@ -370,25 +566,69 @@ def extract_relevant_snippets_few_shot(
     #     response_format={"type": "json_object"},
     #     seed=90128538,  # 90128538
     # )
-    completion = get_chat_completion(
-        model=model, messages=messages, response_format={"type": "json_object"}
-    )
+
     # print("\n Completion:")
     # print(completion)
     # print("\n")
 
-    try:
-        json_response = find_extract_json(completion.choices[0].message.content)
-        sentences = json.loads(json_response)
-    except Exception as e:
-        print(f"Error parsing response as json: {json_response}: {e}")
-        traceback.print_exc()
-        sentences = {"snippets": []}
-    try:
-        snippets = generate_snippets_from_sentences(article, sentences["snippets"])
-    except Exception as e:
-        print(f"Error getting snippets from {sentences}: {e}")
-        snippets = []
+    # try:
+    #     if "deepseek" in model.lower():
+    #         answer = completion.choices[0].message.content.split("</think>")[-1]
+    #     else:
+    #         answer = completion.choices[0].message.content
+    #     json_response = find_extract_json(answer)
+    #     # json_response = find_extract_json(completion.choices[0].message.content)
+    #     sentences = json.loads(json_response)
+    # except Exception as e:
+    #     print(f"Error parsing response as json: {json_response}: {e}")
+    #     traceback.print_exc()
+    #     sentences = {"snippets": []}
+    # try:
+    #     snippets = generate_snippets_from_sentences(article, sentences["snippets"])
+    # except Exception as e:
+    #     print(f"Error getting snippets from {sentences}: {e}")
+    #     snippets = []
+
+    MAX_RETRIES = 3  # 最大重试次数
+    RETRY_INTERVAL = 3  # 重试间隔（秒）
+    for attempt in range(MAX_RETRIES + 1):  # 0~MAX_RETRIES 共 MAX_RETRIES+1 次尝试
+        try:
+            if attempt > 0:
+                random_seed = random.randint(0, 1000000)
+                completion = get_chat_completion(
+                    model=model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    seed=random_seed,
+                )
+            else:
+                completion = get_chat_completion(
+                    model=model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                )
+            if "deepseek" in model.lower():
+                answer = completion.choices[0].message.content.split("</think>")[-1]
+            else:
+                answer = completion.choices[0].message.content
+
+            # JSON 解析与校验
+            json_response = find_extract_json(answer)
+            sentences = json.loads(json_response)
+
+            snippets = generate_snippets_from_sentences(article, sentences["snippets"])
+
+            break
+        except Exception as e:
+            print(f"第 {attempt + 1} 次尝试失败: {str(e)}")
+            traceback.print_exc()
+            if attempt + 1 == MAX_RETRIES:
+                print("⚠️ 达到最大重试次数，启用降级方案")
+                sentences = {"snippets": []}
+                return []
+            else:
+                print(f"⏳ {RETRY_INTERVAL}秒后重试...")
+                time.sleep(RETRY_INTERVAL)
 
     return snippets
 
@@ -471,22 +711,66 @@ def rerank_snippets(examples, n, snippets, question: str, model: str) -> str:
     #     response_format={"type": "json_object"},
     #     seed=90128538,
     # )
-    completion = get_chat_completion(
-        model=model, messages=messages, response_format={"type": "json_object"}
-    )
+    # completion = get_chat_completion(
+    #     model=model, messages=messages, response_format={"type": "json_object"}
+    # )
     # print("\n Completion:")
     # print(completion)
     # print("\n")
-    json_response = find_extract_json(completion.choices[0].message.content)
+    # if "deepseek" in model.lower():
+    #     answer = completion.choices[0].message.content.split("</think>")[-1]
+    # else:
+    #     answer = completion.choices[0].message.content
+    # json_response = find_extract_json(answer)
+    # json_response = find_extract_json(completion.choices[0].message.content)
 
-    try:
-        snippets_reranked = json.loads(json_response)
-        snippets_idx = snippets_reranked["snippets"]
-        filtered_array = [snippets[i] for i in snippets_idx]
-    except Exception as e:
-        # print(f"Error parsing response as json: {json_response}: {e}")
-        traceback.print_exc()
-        filtered_array = snippets
+    # try:
+    #     snippets_reranked = json.loads(json_response)
+    #     snippets_idx = snippets_reranked["snippets"]
+    #     filtered_array = [snippets[i] for i in snippets_idx]
+    # except Exception as e:
+    # print(f"Error parsing response as json: {json_response}: {e}")
+    # traceback.print_exc()
+    # filtered_array = snippets
+
+    MAX_RETRIES = 3  # 最大重试次数
+    RETRY_INTERVAL = 3  # 重试间隔（秒）
+    for attempt in range(MAX_RETRIES + 1):  # 0~MAX_RETRIES 共 MAX_RETRIES+1 次尝试
+        try:
+            if attempt > 0:
+                random_seed = random.randint(0, 1000000)
+                completion = get_chat_completion(
+                    model=model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    seed=random_seed,
+                )
+            else:
+                completion = get_chat_completion(
+                    model=model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                )
+            if "deepseek" in model.lower():
+                answer = completion.choices[0].message.content.split("</think>")[-1]
+            else:
+                answer = completion.choices[0].message.content
+            json_response = find_extract_json(answer)
+
+            snippets_reranked = json.loads(json_response)
+            snippets_idx = snippets_reranked["snippets"]
+            filtered_array = [snippets[i] for i in snippets_idx]
+
+            break
+        except Exception as e:
+            print(f"第 {attempt + 1} 次尝试失败: {str(e)}")
+            traceback.print_exc()
+            if attempt + 1 == MAX_RETRIES:
+                print("⚠️ 达到最大重试次数，启用降级方案")
+                return snippets
+            else:
+                print(f"⏳ {RETRY_INTERVAL}秒后重试...")
+                time.sleep(RETRY_INTERVAL)
 
     return filtered_array
 
@@ -494,12 +778,14 @@ def rerank_snippets(examples, n, snippets, question: str, model: str) -> str:
 def save_state(data, file_path):
     with open(file_path, "wb") as f:
         pickle.dump(data, f)
+        print(f"Saved state to: {file_path}")
 
 
 def load_state(file_path):
     try:
         if os.path.exists(file_path):
             with open(file_path, "rb") as f:
+                print(f"Loaded state from: {file_path}")
                 return pickle.load(f)
     except EOFError:
         return None
@@ -583,20 +869,51 @@ def process_question(
         reordered_articles_ids = []
         relevant_snippets = []
 
-        query_vector = encode_texts(question["body"])
-
         question_id = question["id"]
         print(f"Processing question {question_id}")
+
+        if abstract_boost != 0.0 or title_boost != 0.0:
+            # add rewrite part
+            rewrite_completion = rewrite_original_query(question["body"], model_name)
+            rewrite_query_string = extract_text_wrapped_in_tags(rewrite_completion)
+            # print(f'query: {question["body"]}\nrewrite query: {rewrite_query_string}')
+            
+            attempt = 0
+            MAX_RETRIES = 3
+            while query_string == "ERROR" and attempt < MAX_RETRIES:
+                # 重试时传入之前生成的random_seed
+                random_seed = random.randint(0, 1000000)
+                rewrite_completion = rewrite_original_query(question["body"], model_name, random_seed)
+                rewrite_query_string = extract_text_wrapped_in_tags(rewrite_completion)
+                attempt += 1
+
+            # query_vector = encode_texts(question["body"])
+            query_vector = encode_texts(rewrite_query_string)
+            # query_vector = encode_texts(question["body"])
+        else:
+            query_vector = None
+
         wiki_context = ""
 
         completion = expand_query_few_shot(
             query_examples, n_shot, question["body"], model_name
         )
         query_string = extract_text_wrapped_in_tags(completion)
+
+        attempt = 0
+        MAX_RETRIES = 3
+        while (query_string == "ERROR" or not validate_es_query(query_string)) and attempt < MAX_RETRIES:
+            # 重试时传入之前生成的random_seed
+            random_seed = random.randint(0, 1000000)
+            completion = expand_query_few_shot(
+                query_examples, max(0, n_shot - attempt - 1), question["body"], model_name, seed=random_seed
+            )
+            query_string = extract_text_wrapped_in_tags(completion)
+            attempt += 1
+
         query = create_query(
             query_string, query_vector, text_boost, abstract_boost, title_boost
         )
-
         relevant_articles = run_elasticsearch_query(query)
         if len(relevant_articles) == 0:
             improved_query_completion = refine_query_with_no_results(
@@ -760,6 +1077,7 @@ def execute_evaluation(
 
     except Exception as e:
         print(f"执行评估时发生错误：{str(e)}")
+        traceback.print_exc()
         return False
 
 
@@ -790,8 +1108,8 @@ def parse_args():
         "--model",
         type=str,
         default="mistral",
-        choices=["mistral", "llama3-70b"],
-        help="Select model version (options: mistral, llama3-70b)",
+        choices=["mistral", "llama3-70b", "deepseek-r1:70b-q80", "deepseek-r1:70b", "glm4:32b"],
+        help="Select model version (options: mistral, llama3-70b，deepseek-r1:70b-q80, deepseek-r1:70b, glm4:32b)",
     )
     parser.add_argument(
         "--forward_port",
@@ -803,6 +1121,12 @@ def parse_args():
         "--multiclient",
         action="store_true",
         help="Enable multi-client mode, alternating between multiple OpenAI clients",
+    )
+    parser.add_argument(
+        "--pickle_file",
+        type=str,
+        default=None,
+        help="Path to pickle file containing data from previous runs (default: None)",
     )
 
     return parser.parse_args()
@@ -816,45 +1140,138 @@ def main():
 
     global enable_multiclient
     enable_multiclient = args.multiclient
+    # enable_multiclient = False #######################################################################
     if enable_multiclient:
-        client_openai_1 = OpenAI(
-            api_key="ollama",
-            base_url=f"http://127.0.0.1:11435/v1",
-            timeout=3000,
-        )
-        client_openai_2 = OpenAI(
-            api_key="ollama",
-            base_url=f"http://127.0.0.1:11436/v1",
-            timeout=3000,
-        )
-        client_openai_3 = OpenAI(
-            api_key="ollama",
-            base_url=f"http://127.0.0.1:11437/v1",
-            timeout=3000,
-        )
-        semaphore_1 = threading.Semaphore(2)
-        semaphore_2 = threading.Semaphore(2)
-        semaphore_3 = threading.Semaphore(2)
-
-        global client_rotator
-        # client_rotator = ClientRotator(
-        #     [(client_openai_1, semaphore_1), (client_openai_2, semaphore_2)]
+        # client_openai_1 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11435/v1",
+        #     timeout=3000,
         # )
-        client_rotator = ClientRotator(
-            [(client_openai_1, semaphore_1), (client_openai_2, semaphore_2), (client_openai_3, semaphore_3)]
-        )
+        # client_openai_2 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11436/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_3 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11437/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_4 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11438/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_5 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11439/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_6 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11440/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_7 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11441/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_8 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11442/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_9 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11443/v1",
+        #     timeout=3000,
+        # )
+        # client_openai_10 = OpenAI(
+        #     api_key="ollama",
+        #     base_url=f"http://127.0.0.1:11444/v1",
+        #     timeout=3000,
+        # )
+        # semaphore_1 = threading.Semaphore(2)
+        # semaphore_2 = threading.Semaphore(2)
+        # semaphore_3 = threading.Semaphore(2)
+        # semaphore_4 = threading.Semaphore(2)
+        # semaphore_5 = threading.Semaphore(2)
+        # semaphore_6 = threading.Semaphore(2)
+        # semaphore_7 = threading.Semaphore(2)
+        # semaphore_8 = threading.Semaphore(2)
+        # semaphore_9 = threading.Semaphore(2)
+        # semaphore_10 = threading.Semaphore(2)
+        # global client_rotator
+        # # client_rotator = ClientRotator(
+        # #     [(client_openai_1, semaphore_1), (client_openai_2, semaphore_2)]
+        # # )
+        # # client_rotator = ClientRotator(
+        # #     [(client_openai_1, semaphore_1), (client_openai_2, semaphore_2), (client_openai_3, semaphore_3)]
+        # # )
+        # client_rotator = ClientRotator(
+        #     [
+        #         (client_openai_1, semaphore_1),
+        #         (client_openai_2, semaphore_2),
+        #         (client_openai_3, semaphore_3),
+        #         (client_openai_4, semaphore_4),
+        #         (client_openai_5, semaphore_5),
+        #         (client_openai_6, semaphore_6),
+        #         (client_openai_7, semaphore_7),
+        #         (client_openai_8, semaphore_8),
+        #         (client_openai_9, semaphore_9),
+        #         (client_openai_10, semaphore_10),
+        #     ]
+        # )
+        
+        # 配置参数
+        base_port = 11435  # 起始端口
+        num_clients = 2    # 客户端数量
+        semaphore_value = 2 # 每个信号量的初始值
+
+        # 智能生成端口列表
+        ports = range(base_port, base_port + num_clients)
+        
+        # 批量创建客户端
+        clients = [
+            OpenAI(
+                api_key="ollama",
+                base_url=f"http://127.0.0.1:{port}/v1",
+                timeout=3000,
+            )
+            for port in ports
+        ]
+        
+        # 批量创建信号量
+        semaphores = [threading.Semaphore(semaphore_value) for _ in ports]
+        
+        # 组合客户端与信号量
+        global client_rotator
+        client_rotator = ClientRotator(list(zip(clients, semaphores)))
+        
     else:
         forward_port = args.forward_port
         # Initialize OpenAI client
         global client_openai
-        client_openai = OpenAI(
-            api_key="ollama",
-            base_url=f"http://127.0.0.1:{str(forward_port)}/v1",
-            timeout=3000,
-        )
+        if forward_port == 11434:
+            client_openai = OpenAI(
+                api_key="ollama",
+                base_url="http://localhost:11434/v1",
+                timeout=3000,
+            )
+        else:
+            client_openai = OpenAI(
+                api_key="ollama",
+                base_url=f"http://127.0.0.1:{str(forward_port)}/v1",
+                timeout=3000,
+            )
 
     global embed_model
-    embed_model = BGEM3FlagModel(r"/mnt/data/haoquan/model/bge-m3")
+    if abstract_boost != 0.0 or title_boost != 0.0:
+        embed_model = BGEM3FlagModel(r"/mnt/data/haoquan/model/bge-m3")
+    else:
+        embed_model = None
+        print("Embed model not initialized~")
 
     # model_name = 'llama3.2:3B'
     # model_name = "mistral"
@@ -862,12 +1279,15 @@ def main():
     n_shot = 10
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    pickl_name = (
-        model_name.replace("/", "-").replace(":", "-")
-        if "/" in model_name or ":" in model_name
-        else model_name
-    )
-    pickl_file = f"/home/samsung/haoquan/bioasq2024-main/02_12B/Batch1/PhaseA/{pickl_name}-{n_shot}-shot.pkl"
+    if not args.pickle_file:
+        pickl_name = (
+            model_name.replace("/", "-").replace(":", "-")
+            if "/" in model_name or ":" in model_name
+            else model_name
+        )
+        pickl_file = f"/home/samsung/haoquan/bioasq2024-main/02_12B/Batch1/PhaseA/pkl_{timestamp}-{pickl_name}-{n_shot}-shot.pkl"
+    else:
+        pickl_file = args.pickle_file
 
     input_file_name = "/mnt/data/dataset/BioASQ/Task12BGoldenEnriched/12B1_golden.json"
     # input_file_name = "/home/samsung/haoquan/test.json"
